@@ -1,0 +1,382 @@
+---
+title: "R Analyse"
+output: html_notebook
+---
+Denne R notebook beskriver analysen for prosjektet  "kortdistanspredning. 
+
+```{r setup}
+library(sf)
+library(tidyverse)
+write.excel <- function(x,row.names=FALSE, col.names =TRUE, ...) {
+  write.table(x,"clipboard",sep = "\t",row.names = row.names, col.names = col.names,...)
+}
+```
+
+#Skogdata og feltdata
+Laster inn data som er kartlagt ved hjelp av flybilder. Deretter kopier morbestand inn et nytt lag. 
+
+bestand2k: Er alle bestand av bartrær som er registert innen forarbeidet for 2 km fra senter av morbestandet. 
+
+```{r inn}
+bestand_2k <- st_read("inn/Bestand2k_1_endelig/Bestand2k_1.shp")
+
+morbestand <- filter(bestand_2k, Morbestand == "Ja") %>% arrange(ID)
+morbestand <- st_transform(morbestand, 25832)
+
+#st_write(plot500meter, "out/plot500meter_final.shp")
+plot500meter <- st_read("out/plot500meter_final.shp")
+st_crs(plot500meter) = 25832
+```
+
+
+#Rutenett
+Denne seksjonen deler hver lokalitet inn i et rutenett på 10 x 10 meter. Ved å bruke funksjonen "st_make_grid" fra R pakken SF. Koden "looper" igjennom hver lokasjon. Lokasjonen er fra "Plot 500meter og 2000meter.rmd"  (oppdatert til å lese inn endelig plot500meter fil.)
+
+plot500meter: Er kvadraten på 500 meter
+
+```{r grid 10x10}
+plot500meter <- st_sf(plot500meter)
+
+st_crs(plot500meter)
+#rm(grid500meter)
+#plot500meter <- st_make_valid(plot500meter)
+
+grid500meter = NULL
+for (i in 1:nrow(plot500meter)) {
+  temp_grid500meter <-
+    st_sf(st_make_grid(plot500meter[i,], cellsize = 10))
+  names(temp_grid500meter)[1] <- "geometry"
+  st_geometry(temp_grid500meter) <- "geometry"
+  temp_grid500meter$ID <- i
+  grid500meter <- rbind(grid500meter, temp_grid500meter)
+  rm(temp_grid500meter)
+  print(i) # Too show progress.
+}
+
+grid500meter <- unique(grid500meter)
+st_crs(grid500meter) = 25832
+
+#Klipper morbestand basert på grid
+morbestand_alle_grid <- sf::st_intersection(grid500meter, morbestand)
+
+#Filtrer ut ikke fulle ruter innen morbestandet
+morbestand_alle_grid$area <-
+  as.numeric(st_area(morbestand_alle_grid))
+morbestand_alle_grid <- morbestand_alle_grid %>% filter(area > 95)
+```
+#Avstand senter 10x10m til morbestand
+For å kalkulere avstanden fra senter av 10 x 10 ruten til morbestandet, brukes funksjonen nærmeste naboer fra pakken nngeo. For senterpunktet blir estimert med funksjonen "st_centroid" 
+https://rdrr.io/cran/nngeo/man/st_nn.html
+
+```{r alle}
+tmp_nn <- nngeo::st_nn(
+  st_centroid(grid500meter[1:nrow(grid500meter), ]),
+  st_centroid(morbestand_alle_grid[1:nrow(morbestand_alle_grid), ]),
+  sparse = TRUE, k = 1, maxdist = Inf,
+  returnDist = TRUE, progress = TRUE)
+
+grid500meter$d <- tmp_nn$dist
+rm(tmp_nn)
+
+#st_write(grid500meter, "out/grid500meter_test.shp")
+#grid500meter %>% group_by(ID) %>% summarise(n = n())
+```
+
+
+
+#Funksjon for å generere spredning.
+Hvor grupper av trær er registrert. Blir det trærne automatiske generert innen for registert radius. Det er tre metoder.
+Grupper, her er radius 2,5 meter.
+Sample, her er radius 3,99 meter.
+Totall, her radius 0, men treantall er større enn 1.
+
+Inn filer:
+
+Spredningsreg: Er registert spredning i felt. 
+Sample_og_tot: Er samplet områder og områder med total telling. 
+
+```{r spredning}
+set.seed(2019) #For å kunne reprodusere analysen. 
+# test <- st_read("Test/testdata_R.shp")
+# test <- st_zm(test, drop = TRUE, what = "ZM")
+# test <- st_transform(test, 25832)
+# sum(test$antall) #Sum antall trær 
+
+spredningsreg <- st_read("inn/Spredningsreg/Spredningsreg_190806.shp")
+sample_og_tot <- st_read("inn/Spredningsreg/Sampling_190806.shp")
+
+spredningsreg_20 <- spredningsreg %>% filter(ID == 20)
+
+spredningsreg %>%  as_tibble()  %>% group_by(ID) %>% summarise(Antall = sum(Antall))
+
+#Filter ut punkt hvor enn har tellt alle trær. 
+spredningsreg <- spredningsreg %>%
+   mutate(tot_ja = if_else(Antall > 1 &  Radius == 0,"Ja", "Nei")) %>% st_sf()
+
+
+#Romlig sammenslåing av polygoner og punkter. 
+sample_og_tot_join <- st_join(sample_og_tot, spredningsreg)
+sample_og_tot_join$m2 <- as.numeric(st_area(sample_og_tot_join))
+tot_join  <- sample_og_tot_join %>% filter(tot_ja == "Ja")
+
+
+
+#Estimerer trenatall ved sample. 
+sample_join  <- sample_og_tot_join %>%
+  filter(Radius == 3.99) %>%  #Filter av alle punkt some er samplet (3,99)
+  group_by(GlobalID.x) %>% #GlobadID.x er den unike ID for samplet bestand.
+  summarise(
+    gj.sn = mean(Antall * 20),
+    daa = mean(m2 / 1000),
+    n = n(),
+    tot = round(gj.sn * daa),0)
+
+
+r <- ifelse(spredningsreg$Radius == 0, 0.01,spredningsreg$Radius) # Hvor radius ikke er registert (enkeltrær)
+r <- ifelse(is.na(r),0.01, r)
+
+grp_enkel <- spredningsreg %>% filter(Radius != 3.99) %>% filter(tot_ja == "Nei")
+
+plot <- st_buffer(grp_enkel, r) #Generer sirkler basert radius fra plot/observasjon. 
+#Generere posisjonen for all trær. Gjenskaper også for enkelttrær (radius 0.01). Bruker funksjonen exact = TRUE, for å etablere nøyaktig antall trær (VIKTIG).
+gen_tree = st_sf(st_sample(plot, plot$Antall, exact = TRUE))
+names(gen_tree)[1] <- "geometry"
+st_geometry(gen_tree) <- "geometry"
+gen_tree_join <- st_join(gen_tree, plot, largest = T)  %>% select(Treslag, Forstyrrel, Vegetasjon, ID)
+gen_tree_join$Kommentar <- NA
+
+#For total telling
+gen_tot <- st_sf(st_sample(tot_join, tot_join$Antall, exact = TRUE))
+names(gen_tot)[1] <- "geometry"
+st_geometry(gen_tot) <- "geometry"
+gen_tot_join <- st_join(gen_tot, tot_join, largest = T) %>% select(Treslag, Forstyrrel, Vegetasjon, ID.x, Kommentar) %>% rename(ID = ID.x)
+
+#For sample
+gen_sample <- st_sf(st_sample(sample_join, sample_join$tot, exact = TRUE))
+names(gen_sample)[1] <- "geometry"
+st_geometry(gen_sample) <- "geometry"
+gen_sample_join <- st_join(gen_sample, sample_og_tot_join, largest = T)  %>% select(Treslag, Forstyrrel, Vegetasjon, ID.x, Kommentar) %>% rename(ID = ID.x)
+
+
+#Binder sammen alle punktene til et lag. 
+gen_t <- rbind(gen_tree,gen_tot, gen_sample)
+gen_t_join <- rbind(gen_tree_join,gen_tot_join, gen_sample_join) 
+
+
+
+
+gen_t_join <- gen_t_join %>%
+  mutate(
+    Treslag =
+      recode(
+        Treslag,
+        "1" = "Gran",
+        "2" = "Sitka",
+        "3" = "Lerk",
+      )
+  )
+
+
+gen_t_join <- gen_t_join %>%
+  mutate(
+    Forstyrrel =
+      recode(
+        Forstyrrel,
+        "1" = "Sti",
+        "2" = "Vei",
+        "3" = "Grøft",
+        "4" = "Annet",
+        
+      )
+  )
+
+spredning_all_endelig <-
+  st_join(gen_t_join, grid500meter) %>% 
+  rename(ID = ID.y) %>% 
+  select(ID, Treslag, Forstyrrel, Vegetasjon, d) %>% drop_na(ID)
+
+
+
+spredning_all <- gen_t #st_join(gen_t, plot) # kopierer over registeret data til genererte trær ved hjelp av en spatial join. 
+#rm(gen_tree,gen_tot, gen_sample, gen_t)
+
+st_write(spredning_all, "out/spredning_all.shp", delete_layer = TRUE)
+st_write(spredning_all_endelig, "out/spredning_all_190822.shp", delete_layer = TRUE) 
+
+
+#st_write(grid500meter, "tmp/grid.shp")
+```
+
+
+
+
+
+# Antall observasjoner i hver rute
+
+```{r observasjoner}
+grid500meter$pt_count <- lengths(sf::st_intersects(grid500meter, spredning_all))
+# spredning_test <- sf::st_join(spredning_all, grid500meter)
+```
+
+```{r dbh og høyde}
+# Endrer alle 0 registeringen til NA. 
+spredningsreg <- spredningsreg %>%
+  rowwise %>% mutate(
+    H1 = ifelse(H1 == 0, NA, H1),
+    H2 = ifelse(H2 == 0, NA, H2),
+    H3 = ifelse(H3 == 0, NA, H3),
+    H4 = ifelse(H4 == 0, NA, H4),
+    H5 = ifelse(H5 == 0, NA, H5),
+    D1 = ifelse(D1 == 0, NA, D1),
+    D2 = ifelse(D2 == 0, NA, D2),
+    D3 = ifelse(D3 == 0, NA, D3),
+    D4 = ifelse(D4 == 0, NA, D4),
+    D5 = ifelse(D5 == 0, NA, D5)
+  )
+
+spredningsreg <- spredningsreg %>%
+  mutate(Vegetasjon = as.character(Vegetasjon),
+         Vegetasjon = as.numeric(str_replace(Vegetasjon,",", ".")),
+         Vegetasjon = if_else(Vegetasjon < 1, Vegetasjon * 10, Vegetasjon))
+
+
+
+# #Estimerer gj.sn og st.av for hvert plot. 
+# spredningsreg <- spredningsreg %>% 
+#   rowwise %>% 
+#   mutate(
+#   gj.sn = mean(c(H1, H2, H3, H4, H5), na.rm = T),
+#   st.av = ifelse(!is.na(H1) & !is.na(H2), (sd(c(H1, H2, H3, H4, H5), na.rm = T)), NA))
+# #c(x,x1,x3) er for at å gjøre observasjonen i trær 1 til 5 om til vektor
+
+Heigth <-
+  spredningsreg %>% select(ID, Forstyrrel, Vegetasjon, kongler, geometry, starts_with("H")) %>%  gather(tmp, "h", H1:H5, na.rm = F)
+
+Dbh <-
+  spredningsreg %>% select(ID, Forstyrrel, Vegetasjon, kongler, geometry, starts_with("D")) %>%  gather(tmp, "d", D1:D5, na.rm = F)
+
+h_d <-
+  bind_cols(Heigth, Dbh) %>% select(ID, h, d, Vegetasjon, kongler, Forstyrrel, geometry) 
+
+
+
+h_d <- h_d %>%
+  mutate(h = if_else(h > 20, h / 10, h),
+         d = if_else(d > 20, d / 10, d),
+         h150 = ifelse(h > 1.5, 1, NA),
+         kongler = ifelse(kongler  == "Ja",1, NA),
+         Vegetasjon = ifelse(Vegetasjon == 0, NA, Vegetasjon),
+         hd = h / d)
+
+
+h_d_sum <- h_d %>%
+  filter(ID != 0) %>%
+  as_tibble() %>%
+  group_by(ID) %>%
+  summarise(
+    veg = mean(Vegetasjon, na.rm = T),
+    gj.sn.d = mean(d, na.rm = T),
+    st.av.d = sd(d, na.rm = T),
+    #median.d = median(d, na.rm = T),
+    gj.sn.h = mean(h, na.rm = T),
+    st.av.h = sd(h, na.rm = T),
+    #median.h = median(h, na.rm = T),
+    kongler = sum(kongler, na.rm = T),
+    sumh150 = sum(h150, na.rm = T))
+
+
+h_d_sum
+#write.excel(h_d_sum)
+rm(Heigth, Dbh)
+openxlsx::write.xlsx(h_d_sum, "Excel/h_d_sum.xlsx")
+```
+
+
+
+#Analyse endelig resultat
+
+Her oppsummere enn analysene og produserer det endelige tabellen for rapporten. Funksjonen "rep" kopierer antall observasjonen fra en vektor av samme lengde. Resultat er en ny vektor med en observasjonar for hvert tre. Resultat blir da et veid gjennomsnitt basert på antall trær i ruten. 
+
+Summere en spredning per lokasjon (ID):
+•	Treantall som er registret (antall)
+•	Vekta gjennomsnittlig spredningslengde for alle trær. (gj.sn)
+•	Standardavviket på spredningslengden (st.av). 
+•	Median (median)
+•	Kvatil på 95% (qt.95)
+•	Maks avstand for spredning (maks) 
+
+
+
+```{r sum statistikk}
+grid500 <- grid500meter
+spredning_endelig <- grid500 %>%
+  as_tibble() %>%
+  group_by(ID) %>%
+  summarise(
+    antall = sum(pt_count),
+    #gj.sn = sum(wt_d),
+    gj.sn = mean(rep(d, pt_count)),
+    st.av = sd(rep(d, pt_count)),
+    median = median(rep(d, pt_count)),
+    qt.95 = quantile(rep(d, pt_count), 0.95),
+    maks = max(rep(d, pt_count)),
+    n = n()
+  )
+spredning_endelig
+
+spredning_endelig_alt <- spredning_all_endelig %>%
+  as_tibble() %>%
+  group_by(ID) %>%
+  summarise(
+    antall = n(),
+    #gj.sn = sum(wt_d),
+    gj.sn = mean(d),
+    st.av = sd(d),
+    median = median(d),
+    qt.95 = quantile(d, 0.95, na.rm = T),
+    maks = max(d),
+    n = n())
+spredning_endelig
+
+
+
+#write.excel(spredning_endelig)
+openxlsx::write.xlsx(spredning_endelig, "Excel/spredning_endelig.xlsx")
+openxlsx::write.xlsx(spredning_endelig_alt, "Excel/spredning_endelig_alt.xlsx")
+```
+
+
+
+
+```{r NiN}
+
+NiN <- st_read("inn/Spredningsreg/plot_500m_ar5_merge1_190808.shp")
+NiN <- lwgeom::st_make_valid(NiN)
+
+NiN %>% group_by(ID) %>%
+  summarise(area = sum(Shape__Are))
+
+NiN$pt_count <- lengths(sf::st_intersects(NiN, spredning_all))
+
+NiN$m2 <- as.numeric(st_area(NiN))
+
+NiN_sum <- NiN %>% as_tibble %>% group_by(ID, Hovedtype) %>% summarise(daa = sum(m2 / 1000),
+                                                            obs = sum(pt_count))
+
+NiN %>% group_by(ID) %>%
+  summarise(area = sum(Shape__Are),
+            m2 = sum(m2))
+
+
+NiN_sum
+#write.excel(NiN_sum)
+openxlsx::write.xlsx(NiN_sum, "Excel/NiN_sum.xlsx")
+```
+
+
+```{r}
+st_write(spredning_all, "spredning_all.shp", delete_layer = TRUE)
+
+st_write(NiN, "NiN_med_obs.shp")
+```
+
